@@ -1,20 +1,81 @@
-from dataprocess import Data
-from modelclassifier import ArxivClassifier, Token
+#Fine-tune MiniLM to predict arXiv categories from a paper's title + abstract
 
+import random
+import numpy as np
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from transformers import AutoTokenizer
 
+
+from dataprocess import Data
+from modelclassifier import ArxivClassifier, make_loaders, save_checkpoint
+from training import fit, make_loss_fn, make_optimizer
 
 #--------------CONFIG----------------
-data_path = "arxiv_metadata.json"
-model_name = "sentence-transformers/all-MiniLM-L6-v2"
-nb_papers = 8191   # max is 1700000
-max_len = 128 
-lr = 2e-4    #learning rate
-epochs = 10 
-device = device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DATA_PATH = "arxiv_metadata.json"
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+NB_PAPERS = 8191           # None = the whole file
+MAX_LEN = 128              # tokens kept per paper (title + start of the abstract)
+BATCH_SIZE = 32            
+EPOCHS = 10
+LR_ENCODER = 5e-5          # small: the unfrozen transformer layers are already trained
+LR_HEAD = 1e-3             # larger: the head starts from random weights
+
+N_TRAINABLE_LAYERS = 2     # last 2 of MiniLM's 6 layers are fine-tuned  
+VAL_FRAC = 0.1             # validation percentage
+POS_WEIGHT_CAP = 50.0      # limit on how much rare categories are up-weighted in the loss
+THRESHOLD = 0.5            # probability above which a category is predicted
+SEED = 0
+CHECKPOINT = "arxiv_classifier.pt"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+
+def main():
+    set_seed(SEED)
+
+    # 1. Data
+    data = Data(DATA_PATH, NB_PAPERS)
+    print(f"{len(data.texts)} papers | {data.n_cats} categories | device: {DEVICE}")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    train_loader, val_loader = make_loaders(
+        tokenizer, data.texts, data.labels, MAX_LEN, BATCH_SIZE, VAL_FRAC, SEED
+    )
+
+    # 2. Model
+    model = ArxivClassifier(MODEL_NAME, data.n_cats, N_TRAINABLE_LAYERS).to(DEVICE)
+
+    # 3. Loss and optimiser
+    train_labels = data.labels[train_loader.dataset.indices]  # training split only
+    loss_fn = make_loss_fn(train_labels, POS_WEIGHT_CAP, DEVICE)
+    optimizer, scheduler = make_optimizer(model, LR_HEAD, LR_ENCODER, EPOCHS, len(train_loader))
+
+    # 4. Train (the model comes back with the weights of its best epoch)
+    best = fit(model, train_loader, val_loader, loss_fn, optimizer, scheduler, EPOCHS, DEVICE, THRESHOLD)
+
+    # 5. Save
+    save_checkpoint(CHECKPOINT, model, MODEL_NAME, data.categories, MAX_LEN)
+    print(f"Best epoch: {best['epoch']} (validation micro-F1 {best['micro_f1']:.3f}). Saved to {CHECKPOINT}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
 
 #--------------DATA----------------
 metadata = Data(data_path, nb_papers)

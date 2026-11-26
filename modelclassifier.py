@@ -1,112 +1,99 @@
-from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer
+# MiniLM encoder + classification head, data loaders, and checkpoint save/load
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, random_split
+from transformers import AutoModel
 
 
-#--------------TOKENIZATION----------------
-class Token:
 
-    def __init__(self, model, texts, max_len=128):
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
-        self.texts = texts
-        self.max_len = max_len
-        self.enc = self.tokenizer(         #The Tokens
-            self.texts,
-            max_length = self.max_len, 
-            padding = "max_length", 
-            truncation = True, 
-            return_tensors = "pt")
-
-    def get(self):
-        return self.enc
-
-    def make_dataset(self, labels):
-        dataset = TensorDataset(
-        self.enc["input_ids"],
-        self.enc["attention_mask"],
-        labels)
-
-        loader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-        return loader
-
-
-    '''
-    # 80/10/10 split — train, validation, test
-    total    = len(texts) // BATCH_SIZE
-    n_test   = total // 10
-    n_val    = total // 10
-    test_ds  = dataset.take(n_test)
-    val_ds   = dataset.skip(n_test).take(n_val)
-    train_ds = dataset.skip(n_test + n_val)
-    '''
-
-
-#--------------MODEL----------------
+# -------------- EMBEDDINGS --------------
 def mean_pooling(last_hidden_state, attention_mask):
-    mask = attention_mask.unsqueeze(-1).float()
+    """Average the token vectors of a text, ignoring padding tokens."""
+    mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
     return (last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
 
+def embed(encoder, input_ids, attention_mask):
+    """One L2-normalised vector per text: the same embedding sentence-transformers produces
+    for all-MiniLM-L6-v2. The dot product of two of them is their cosine similarity."""
+    out = encoder(input_ids=input_ids, attention_mask=attention_mask)
+    return F.normalize(mean_pooling(out.last_hidden_state, attention_mask), p=2, dim=1)
 
-class ArxivClassifier(nn.Module):          #PyTorch Model format
-    def __init__(self, model_name, n_cats):
-        super().__init__() 
 
-        self.st_model = SentenceTransformer(model_name)
-        self.transformer = self.st_model[0]
-        hidden = self.transformer.config.hidden_size
+# -------------- DATA LOADERS --------------
+def make_loaders(tokenizer, texts, labels, max_len=128, batch_size=32, val_frac=0.1, seed=0):
+    """Tokenise all texts, then split into a training and a validation loader."""
+    enc = tokenizer(texts, max_length=max_len, padding="max_length", truncation=True, return_tensors="pt")
+    dataset = TensorDataset(enc["input_ids"], enc["attention_mask"], torch.as_tensor(labels, dtype=torch.float32))
+    n_val = max(1, int(len(dataset) * val_frac))
+    train_ds, val_ds = random_split(dataset, [len(dataset) - n_val, n_val], generator=torch.Generator().manual_seed(seed))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    return train_loader, val_loader
 
-        #different layers
-        self.fc1 = nn.Linear(hidden, 256)     #explain numbers
-        self.dropout = nn.Dropout(0.1)
-        self.norm = nn.LayerNorm(256)
-        self.fc2 = nn.Linear(256, n_cats)
-        
-        self.freeze_transformer()
 
-    def freeze_transformer(self):
-        for param in self.transformer.parameters(): #freezes all layers
-            param.requires_grad = False
-        for i in [4,5]:
-            for param in self.transformer.auto_model.encoder.layer[i].parameters(): #unfreezes layers 4 and 5 (which are the relevant ones)
-                param.requires_grad = True
+# -------------- MODEL --------------
+class ArxivClassifier(nn.Module):
+    def __init__(self, model_name, n_cats, n_trainable_layers=2, head_hidden=256, dropout=0.1):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(model_name)
+        dim = self.encoder.config.hidden_size  # 384 for MiniLM-L6
+
+        self.head = nn.Sequential(
+            nn.Linear(dim, head_hidden),     # 384 -> 256: small hidden layer
+            nn.LayerNorm(head_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, n_cats),  # one score (logit) per category
+            )
+        self.freeze_encoder(n_trainable_layers)
+
+    def freeze_encoder(self, n_trainable_layers):
+        """Freeze the encoder, then unfreeze its last n layers (MiniLM-L6 has 6: 0..5).
+        The head is never frozen."""
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        layers = self.encoder.encoder.layer
+        for layer in layers[len(layers) - n_trainable_layers:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+    def encode(self, input_ids, attention_mask):
+        return embed(self.encoder, input_ids, attention_mask)
 
     def forward(self, input_ids, attention_mask):
-        features = {"input_ids": input_ids, "attention_mask": attention_mask}
-        #kind of network architecture
-        outputs = self.transformer(features)
-
-        x = mean_pooling(outputs["token_embeddings"], attention_mask)
-        x = F.normalize(x, p=2, dim=1)
-        x = F.gelu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.norm(x)
-        logits = self.fc2(x)
-        return logits #predictions 
-
-    def parameters(self):
-        """Yield all trainable parameters for the optimizer."""
-        yield from self.transformer.parameters()
-
-    def train(self):
-        self.transformer.train()
+        return self.head(self.encode(input_ids, attention_mask))  # logits, (batch, n_cats)
 
 
-    def eval(self):
-        self.transformer.eval()
 
-    def to(self, device):
-        self.transformer.to(device)
-        return self
+# -------------- CHECKPOINTS --------------
+def save_checkpoint(path, model, model_name, categories, max_len):
+    """Save the weights (encoder + head) together with what is needed to rebuild the model."""
+    torch.save(
+        {
+            "model_name": model_name,
+            "categories": list(categories),  # index i of the output = categories[i]
+            "max_len": max_len,
+            "head_hidden": model.head[0].out_features,
+            "state_dict": model.state_dict(),
+        },
+        path,
+    )
 
-    def state_dict(self):
-        return {
-            "transformer": self.transformer.state_dict(),
-        }
 
-    def load_state_dict(self, sd):
-        self.transformer.load_state_dict(sd["transformer"])
+def load_checkpoint(path, device="cpu"):
+    """Rebuild the model from a checkpoint. Returns (model in eval mode, checkpoint dict)."""
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    if "state_dict" not in ckpt:
+        raise ValueError(
+            f"{path} is in the old format (encoder weights only, no head, no category list). "
+            "Retrain with main.py to get a usable checkpoint."
+        )
+    model = ArxivClassifier(ckpt["model_name"], len(ckpt["categories"]), head_hidden=ckpt["head_hidden"])
+    model.load_state_dict(ckpt["state_dict"])
+    model.to(device).eval()
+    return model, ckpt
+
+

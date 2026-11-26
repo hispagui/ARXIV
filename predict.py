@@ -1,75 +1,71 @@
+"""Predict arXiv categories for a paper title (and optionally its abstract).
+
+    python predict.py "Étale fundamental groups in algebraic geometry"
+    python predict.py "Some title" --abstract "The abstract..." --threshold 0.3
+"""
+
+import argparse
 import torch
-from dataprocess import Data
-from modelclassifier import ArxivClassifier, Token
+from transformers import AutoTokenizer
+from dataprocess import paper_text
+from modelclassifier import load_checkpoint
 
 
-#--------------CONFIG (mirror training)----------------
-data_path = "arxiv_metadata.json"
-model_name = "sentence-transformers/all-MiniLM-L6-v2"
-nb_papers = 50
-max_len = 128 
-threshold = 0.5
-weights    = "arxiv_classifier.pt"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CHECKPOINT = "arxiv_classifier.pt"
+THRESHOLD = 0.5
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# --------------LOAD VOCAB & MODEL----------------
-# We re-use Data just to rebuild the same cat2idx mapping used during training.
-metadata  = Data(data_path, nb_papers)
-n_cats    = metadata.n_cats
-idx2cat   = {i: cat for cat, i in metadata.cat2idx.items()}
 
-model = ArxivClassifier(model_name, n_cats)
-model.load_state_dict(torch.load(weights, map_location=device))
-model.to(device)
-model.eval()
+class Predictor:
+    """Loads the model, tokenizer and category list once; then predict() can be called many times."""
 
+    def __init__(self, checkpoint=CHECKPOINT, device=DEVICE):
+        self.device = device
+        self.model, ckpt = load_checkpoint(checkpoint, device)
+        self.tokenizer = AutoTokenizer.from_pretrained(ckpt["model_name"])
+        self.categories = ckpt["categories"]  # the exact list used during training
+        self.max_len = ckpt["max_len"]
 
-# --------------PREDICT----------------
-def predict(title: str, threshold: float = threshold) -> list[str]:
-    """
-    Given a paper title string, return the predicted arXiv category labels.
-    """
-    tokenizer = Token(model_name, [title], max_len=max_len)
-    enc = tokenizer.get()
+    @torch.no_grad()
+    def probabilities(self, title, abstract=""):
+        """All categories with their probability, most likely first."""
+        enc = self.tokenizer(
+            [paper_text(title, abstract)],
+            max_length=self.max_len, truncation=True, padding=True, return_tensors="pt",
+        ).to(self.device)
+        probs = torch.sigmoid(self.model(enc["input_ids"], enc["attention_mask"]))[0].cpu()
+        return sorted(zip(self.categories, probs.tolist()), key=lambda x: x[1], reverse=True)
 
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
-
-    with torch.no_grad():
-        logits = model.forward(input_ids, attention_mask)       # (1, n_cats)
-        probs  = torch.sigmoid(logits).squeeze(0)               # (n_cats,)
-
-    predicted = [
-        (idx2cat[i], round(probs[i].item(), 3))
-        for i in range(n_cats)
-        if probs[i] >= threshold
-    ]
-
-    # Sort by confidence descending
-    predicted.sort(key=lambda x: x[1], reverse=True)
-    return predicted
+    def predict(self, title, abstract="", threshold=THRESHOLD):
+        """Categories whose probability is at least `threshold`."""
+        return [(cat, p) for cat, p in self.probabilities(title, abstract) if p >= threshold]
 
 
-# --------------ENTRY POINT----------------
-if __name__ == "__main__":
-    title = "Étale Fundamental Groups -- a geometric and topological approach to fundamental groups in algebraic geometry"
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("title", nargs="?", default=(
+        "Étale Fundamental Groups -- a geometric and topological approach "
+        "to fundamental groups in algebraic geometry"))
+    parser.add_argument("--abstract", default="")
+    parser.add_argument("--threshold", type=float, default=THRESHOLD)
+    parser.add_argument("--checkpoint", default=CHECKPOINT)
+    args = parser.parse_args()
 
-    results = predict(title)
+    predictor = Predictor(args.checkpoint)
+    ranked = predictor.probabilities(args.title, args.abstract)
+    above = [(cat, p) for cat, p in ranked if p >= args.threshold]
 
-    print(f"\nTitle: '{title}'")
-    print(f"Predicted categories (threshold={threshold}):")
-    if results:
-        for cat, conf in results:
-            print(f"  {cat:<20} {conf:.3f}")
+    print(f"\nTitle: '{args.title}'")
+    print(f"Predicted categories (threshold={args.threshold}):")
+    if above:
+        for cat, p in above:
+            print(f"  {cat:<20} {p:.3f}")
     else:
-        print("  No category exceeded the threshold.")
-        print("\n  Top 3 regardless of threshold:")
-        tokenizer = Token(model_name, [title], max_len=max_len)
-        enc       = tokenizer.get()
-        with torch.no_grad():
-            logits = model.forward(enc["input_ids"].to(device), enc["attention_mask"].to(device))
-            probs  = torch.sigmoid(logits).squeeze(0)
-        top3 = probs.topk(3)
-        for score, idx in zip(top3.values, top3.indices):
-            print(f"  {idx2cat[idx.item()]:<20} {score.item():.3f}")
+        print("  No category exceeded the threshold. Top 3:")
+        for cat, p in ranked[:3]:
+            print(f"  {cat:<20} {p:.3f}")
+
+
+if __name__ == "__main__":
+    main()
