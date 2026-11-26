@@ -1,5 +1,6 @@
 # MiniLM encoder + classification head, data loaders, and checkpoint save/load
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,12 +24,25 @@ def embed(encoder, input_ids, attention_mask):
 
 
 # -------------- DATA LOADERS --------------
-def make_loaders(tokenizer, texts, labels, max_len=128, batch_size=32, val_frac=0.1, seed=0):
-    """Tokenise all texts, then split into a training and a validation loader."""
-    enc = tokenizer(texts, max_length=max_len, padding="max_length", truncation=True, return_tensors="pt")
-    dataset = TensorDataset(enc["input_ids"], enc["attention_mask"], torch.as_tensor(labels, dtype=torch.float32))
+def make_loaders(tokenizer, texts, labels, max_len=128, batch_size=32, val_frac=0.1, seed=0,
+                 chunk_size=2000):
+    """Tokenise all texts, then split into a training and a validation loader.
+       Texts are tokenised chunk_size at a time"""
+    ids, masks = [], []
+    for start in range(0, len(texts), chunk_size):
+        enc = tokenizer(
+            texts[start:start + chunk_size],
+            max_length=max_len, padding="max_length", truncation=True, return_tensors="pt",
+        )
+        ids.append(enc["input_ids"])
+        masks.append(enc["attention_mask"])
+    dataset = TensorDataset(
+        torch.cat(ids), torch.cat(masks), torch.as_tensor(labels, dtype=torch.float32)
+    )
     n_val = max(1, int(len(dataset) * val_frac))
-    train_ds, val_ds = random_split(dataset, [len(dataset) - n_val, n_val], generator=torch.Generator().manual_seed(seed))
+    train_ds, val_ds = random_split(
+        dataset, [len(dataset) - n_val, n_val], generator=torch.Generator().manual_seed(seed)
+    )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
     return train_loader, val_loader
@@ -71,6 +85,7 @@ class ArxivClassifier(nn.Module):
 # -------------- CHECKPOINTS --------------
 def save_checkpoint(path, model, model_name, categories, max_len):
     """Save the weights (encoder + head) together with what is needed to rebuild the model."""
+    tmp = path + ".tmp"
     torch.save(
         {
             "model_name": model_name,
@@ -79,8 +94,9 @@ def save_checkpoint(path, model, model_name, categories, max_len):
             "head_hidden": model.head[0].out_features,
             "state_dict": model.state_dict(),
         },
-        path,
+        tmp,
     )
+    os.replace(tmp, path)  # write then rename: a crash mid-save never leaves a broken file
 
 
 def load_checkpoint(path, device="cpu"):

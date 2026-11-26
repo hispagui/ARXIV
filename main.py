@@ -1,5 +1,6 @@
 #Fine-tune MiniLM to predict arXiv categories from a paper's title + abstract
 
+import os
 import random
 import numpy as np
 import torch
@@ -7,16 +8,17 @@ from transformers import AutoTokenizer
 
 
 from dataprocess import Data
-from modelclassifier import ArxivClassifier, make_loaders, save_checkpoint
-from training import fit, make_loss_fn, make_optimizer
+from modelclassifier import ArxivClassifier, get_device, make_loaders, save_checkpoint
+from training import fit, load_training_state, make_loss_fn, make_optimizer, save_training_state
 
 #--------------CONFIG----------------
-DATA_PATH = "arxiv_metadata.json"
+DATA_PATH = "arxiv_metadata.json"      # The Kaggle download
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-NB_PAPERS = 8191           # None = the whole file
+NB_PAPERS = 300000         # None = the whole file
+RANDOM_SAMPLE = True
 MAX_LEN = 128              # tokens kept per paper (title + start of the abstract)
 BATCH_SIZE = 32            
-EPOCHS = 10
+EPOCHS = 3
 LR_ENCODER = 5e-5          # small: the unfrozen transformer layers are already trained
 LR_HEAD = 1e-3             # larger: the head starts from random weights
 
@@ -26,7 +28,15 @@ POS_WEIGHT_CAP = 50.0      # limit on how much rare categories are up-weighted i
 THRESHOLD = 0.5            # probability above which a category is predicted
 SEED = 0
 CHECKPOINT = "arxiv_classifier.pt"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+STATE_PATH = "arxiv_classifier_last.pt"
+RESUME = True
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():   # Apple Silicon GPU (M1, M2, …)
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -39,7 +49,7 @@ def main():
     set_seed(SEED)
 
     # 1. Data
-    data = Data(DATA_PATH, NB_PAPERS)
+    data = Data(DATA_PATH, NB_PAPERS, RANDOM_SAMPLE, SEED)
     print(f"{len(data.texts)} papers | {data.n_cats} categories | device: {DEVICE}")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     train_loader, val_loader = make_loaders(
@@ -54,127 +64,39 @@ def main():
     loss_fn = make_loss_fn(train_labels, POS_WEIGHT_CAP, DEVICE)
     optimizer, scheduler = make_optimizer(model, LR_HEAD, LR_ENCODER, EPOCHS, len(train_loader))
 
-    # 4. Train (the model comes back with the weights of its best epoch)
-    best = fit(model, train_loader, val_loader, loss_fn, optimizer, scheduler, EPOCHS, DEVICE, THRESHOLD)
+    # 4. Resume from the last finished epoch, if there is one.
+    # These settings must match for a resume to make sense (same papers, same split, same schedule).
+    run_config = {
+        "data_path": DATA_PATH, "model_name": MODEL_NAME, "nb_papers": NB_PAPERS,
+        "random_sample": RANDOM_SAMPLE, "max_len": MAX_LEN, "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS, "lr_encoder": LR_ENCODER, "lr_head": LR_HEAD,
+        "n_trainable_layers": N_TRAINABLE_LAYERS, "val_frac": VAL_FRAC,
+        "pos_weight_cap": POS_WEIGHT_CAP, "seed": SEED,
+    }
+    start_epoch, best = 1, None
+    if RESUME and os.path.exists(STATE_PATH):
+        start_epoch, best = load_training_state(STATE_PATH, model, optimizer, scheduler, run_config)
+        if start_epoch > EPOCHS:
+            print(f"This run already finished all {EPOCHS} epochs (best: epoch {best['epoch']}, "
+                  f"micro-F1 {best['micro_f1']:.3f}). Delete {STATE_PATH} to train again.")
+            return
+        print(f"Resuming from {STATE_PATH}: starting at epoch {start_epoch}/{EPOCHS}")
 
-    # 5. Save
-    save_checkpoint(CHECKPOINT, model, MODEL_NAME, data.categories, MAX_LEN)
-    print(f"Best epoch: {best['epoch']} (validation micro-F1 {best['micro_f1']:.3f}). Saved to {CHECKPOINT}")
+    # 5. Train, saving after every epoch
+    def on_epoch_end(epoch, best, is_best):
+        if is_best:
+            save_checkpoint(CHECKPOINT, model, MODEL_NAME, data.categories, MAX_LEN)
+        save_training_state(STATE_PATH, model, optimizer, scheduler, epoch, best, run_config)
 
+    best = fit(model, train_loader, val_loader, loss_fn, optimizer, scheduler, EPOCHS, DEVICE,
+               THRESHOLD, start_epoch=start_epoch, best=best, seed=SEED, on_epoch_end=on_epoch_end)
 
-if __name__ == "__main__":
-    main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-#--------------DATA----------------
-metadata = Data(data_path, nb_papers)
-texts, labels = metadata.load_arxiv(nb_papers)
-n_cats = metadata.n_cats
-
-tokenizer     = Token(model_name, texts, max_len=max_len)
-labels_tensor = torch.tensor(labels, dtype=torch.float32)
-loader        = tokenizer.make_dataset(labels_tensor)
-
-#--------------MODEL----------------
-model = ArxivClassifier(model_name, n_cats)
-model.to(device) # where to allocate computation, default is CPU
-
-#--------------LOSS----------------
-'''sigmoid activation layer + BinaryCrossEntroy'''
-
-pos_counts = labels_tensor.sum(dim=0).clamp(min=1)
-neg_counts  = len(labels_tensor) - pos_counts
-pos_weight  = (neg_counts / pos_counts).to(device)
-
-loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-#--------------OPTIMISER----------------
-''' Optimiser, each batch : 1. compute gradients, 2. update weights
-AdamW is an improved gradient descent method
-OneCycleLR is scheduler, controls how learning rate changes
-'''
-trainable = [p for p in model.parameters() if p.requires_grad]
-optimizer = AdamW(trainable, lr=lr, weight_decay=1e-2)
-
-scheduler = OneCycleLR(
-    optimizer,
-    max_lr=lr,
-    steps_per_epoch=len(loader),
-    epochs=epochs,
-)
-
-#--------------METRICS----------------
-def compute_metrics(logits, targets, threshold=0.5):
-    preds = (torch.sigmoid(logits) >= threshold).float()  #transforms raw scores [-1.2, 3.5, ...] into proba between [0,1]
-
-    exact_match = (preds == targets).all(dim=1).float().mean().item()
-
-    tp = (preds * targets).sum(dim=0)          #true positive
-    fp = (preds * (1 - targets)).sum(dim=0)    #false positive
-    fn = ((1 - preds) * targets).sum(dim=0)    #false negative
-    precision = tp / (tp + fp).clamp(min=1e-9) #how many of the labels predicted are correct
-    recall    = tp / (tp + fn).clamp(min=1e-9) #of true labels how many successfully found 
-    
-    f1        = 2 * precision * recall / (precision + recall).clamp(min=1e-9)  
-    macro_f1  = f1.mean().item()
-
-    return exact_match, macro_f1
-
-#--------------TRAINING----------------
-def train(model, loader, loss_fn, optimizer, scheduler, epochs, device):
-    model.train()
-
-    for epoch in range(1, epochs + 1):
-        total_loss  = 0.0
-        total_exact = 0.0
-        total_f1    = 0.0
-
-        for input_ids, attention_mask, targets in loader:
-            input_ids      = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            targets        = targets.to(device)
-
-            optimizer.zero_grad()
-            logits = model.forward(input_ids, attention_mask)
-            loss   = loss_fn(logits, targets)
-            loss.backward()
-            
-            nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                max_norm=1.0,
-            )
-            optimizer.step()
-            scheduler.step()
-
-            exact, f1 = compute_metrics(logits.detach(), targets.detach())
-            total_loss  += loss.item()
-            total_exact += exact
-            total_f1    += f1
-
-        n = len(loader)
-        print(
-            f"Epoch {epoch:>3}/{epochs} | "
-            f"Loss: {total_loss/n:.4f} | "
-            f"Exact-match: {total_exact/n:.4f} | "
-            f"Macro-F1: {total_f1/n:.4f}"
-        )
-
-    return model
+    print(f"Done. Best epoch: {best['epoch']} (validation micro-F1 {best['micro_f1']:.3f}), "
+          f"saved in {CHECKPOINT}")
 
 
-if __name__ == "__main__":
-    print(f"Training on {device}  |  {n_cats} categories  |  {len(texts)} papers")
-    model = train(model, loader, loss_fn, optimizer, scheduler, epochs, device)
-    torch.save(model.state_dict(), "arxiv_classifier.pt")
-    print("Model saved to arxiv_classifier.pt")
+
+
+
+
+

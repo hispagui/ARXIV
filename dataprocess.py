@@ -1,3 +1,4 @@
+
 import json
 import numpy as np
 
@@ -14,17 +15,33 @@ def paper_text(title, abstract=""):
     return f"{title}. {abstract}" if abstract else title
 
 
+def count_lines(path):
+    #Number of lines in a file, read in 16 MB chunks
+    n = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 24):
+            n += chunk.count(b"\n")
+    return n
 
-def iter_papers(path, max_papers=None):
+def iter_papers(path, max_papers=None, random_sample=False, seed=0):
     #Yield one paper (a dict) per line of the file
     #Kaggle file is JSON Lines, exactly one JSON object per line 
     #To make a small test file, keep it in that format, e.g.  head -n 2000 arxiv-metadata-oai-snapshot.json > sample.jsonl
+
+    keep = None  # line numbers to keep; None = keep every line
+    if random_sample and max_papers is not None:
+        n_lines = count_lines(path)
+        if max_papers < n_lines:
+            rng = np.random.default_rng(seed)
+            keep = set(rng.choice(n_lines, size=max_papers, replace=False).tolist())
 
     n = 0
     with open(path, encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             if max_papers is not None and n >= max_papers:
                 break
+            if keep is not None and (line_no - 1) not in keep:
+                continue  # skipped lines are never parsed, so sampling stays fast
             line = line.strip()
             if not line:
                 continue
@@ -42,7 +59,7 @@ def iter_papers(path, max_papers=None):
 
 
 class Data:
-    #Reads file once and keeps paper ids, texts, the category vocabulary and the labels
+    # Reads file once and keeps paper ids, texts, the category vocabulary and the labels
     def __init__(self, path, max_papers=None):
         self.ids, self.texts, cat_lists = [], [], []
         for paper in iter_papers(path, max_papers):
@@ -69,63 +86,3 @@ class Data:
         return labels
 
 
-
-
-
-
-
-
-
-
-
-
-
-    def build_cat_vocab(self, max_papers=5):
-        """ 
-        Scan the dataset once to collect all categories.
-        Returns dictionnary with each {category : index}
-        """
-        cats = set()
-        with open(self.path) as f:
-            for i, line in enumerate(f):
-                if i >= max_papers:
-                    break
-                metadata = json.loads(line)
-                for cat in metadata["categories"].strip().split():
-                    cats.add(cat)
-        # Sort for determinism — same order every run
-        self.cat2idx = {cat: i for i, cat in enumerate(sorted(cats))}
-        return self.cat2idx
-    
-
-
-
-
-
-
-    
-
-    def load_arxiv(self, max_papers = 5):
-        texts = []
-        labels = []
-        with open(self.path) as f:
-            for i, line in enumerate(f):
-                if i >= max_papers:
-                    break
-                metadata = json.loads(line)
-                metadata["title"] = metadata["title"].replace('\n', ' ')
-                metadata["abstract"] = metadata["abstract"].replace('\n', ' ')
-                text = (
-                    f"Title: {metadata['title'].strip()}. "
-                    f"Abstract: {metadata['abstract'].strip()}."
-                )
-                label = np.zeros(self.n_cats, dtype = np.float32)
-                for cat in metadata["categories"].strip().split():
-                    if cat in self.cat2idx:
-                        label[self.cat2idx[cat]] = 1.0
-
-                texts.append(text)
-                labels.append(label)
-
-        return texts, np.array(labels)
-    

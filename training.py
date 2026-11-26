@@ -3,10 +3,19 @@
 Nothing here knows about file paths or config values: main.py passes everything in.
 """
 
+import os
+import time
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
+
+
+def format_time(seconds):
+    """3725 -> '1h02m', 95 -> '1m35s'."""
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
 
 
 # -------------- LOSS --------------
@@ -61,12 +70,13 @@ def compute_metrics(logits, targets, threshold=0.5):
 
 
 # -------------- ONE EPOCH / EVALUATION --------------
-def train_one_epoch(model, loader, loss_fn, optimizer, scheduler, device):
-    """One pass over the training data. Returns the average training loss."""
+def train_one_epoch(model, loader, loss_fn, optimizer, scheduler, device, log_every=100):
+    """One pass over the training data. Returns the average training loss.
+    Every `log_every` batches, prints progress and the time left in this epoch."""
     model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
-    total_loss = 0.0
-    for input_ids, attention_mask, targets in loader:
+    total_loss, n_batches, start = 0.0, len(loader), time.time()
+    for step, (input_ids, attention_mask, targets) in enumerate(loader, start=1):
         input_ids, attention_mask, targets = (
             input_ids.to(device), attention_mask.to(device), targets.to(device)
         )
@@ -77,6 +87,13 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scheduler, device):
         optimizer.step()
         scheduler.step()
         total_loss += loss.item() * len(targets)
+
+        if step % log_every == 0 or step == n_batches:
+            elapsed = time.time() - start
+            left = elapsed / step * (n_batches - step)
+            print(f"\r  batch {step}/{n_batches} | {format_time(elapsed)} elapsed | "
+                  f"~{format_time(left)} left in this epoch ", end="", flush=True)
+    print()
     return total_loss / len(loader.dataset)
 
 
@@ -99,23 +116,76 @@ def evaluate(model, loader, loss_fn, device, threshold=0.5):
 
 
 # -------------- FULL TRAINING --------------
-def fit(model, train_loader, val_loader, loss_fn, optimizer, scheduler, epochs, device, threshold=0.5):
-    """Train for `epochs` epochs, evaluating on the validation set after each one.
+def fit(model, train_loader, val_loader, loss_fn, optimizer, scheduler, epochs, device,
+        threshold=0.5, start_epoch=1, best=None, seed=0, on_epoch_end=None):
+    """Train from `start_epoch` to `epochs`, evaluating on the validation set after each epoch.
 
-    Keeps a copy of the weights from the best epoch (highest validation micro-F1) and puts
-    them back into the model at the end. Returns that epoch's validation metrics.
+    best:          validation metrics of the best epoch so far (None for a new run).
+    on_epoch_end:  called as on_epoch_end(epoch, best, is_best) after every epoch;
+                   main.py uses it to save the model and the training state.
+    Returns the metrics of the best epoch (highest validation micro-F1).
     """
-    best, best_weights = None, None
-    for epoch in range(1, epochs + 1):
+    run_start = time.time()
+    for epoch in range(start_epoch, epochs + 1):
+        # Seeding per epoch gives the same shuffling and dropout whether or not the run was resumed
+        torch.manual_seed(seed + epoch)
+        epoch_start = time.time()
+
         train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, scheduler, device)
         m = evaluate(model, val_loader, loss_fn, device, threshold)
+
+        is_best = best is None or m["micro_f1"] > best["micro_f1"]
+        if is_best:
+            best = {**m, "epoch": epoch}
+
+        epochs_done = epoch - start_epoch + 1
+        time_left = (time.time() - run_start) / epochs_done * (epochs - epoch)
         print(
             f"Epoch {epoch:>3}/{epochs} | train loss {train_loss:.4f} | val loss {m['loss']:.4f} | "
-            f"exact {m['exact_match']:.3f} | micro-F1 {m['micro_f1']:.3f} | macro-F1 {m['macro_f1']:.3f}"
+            f"exact {m['exact_match']:.3f} | micro-F1 {m['micro_f1']:.3f} | macro-F1 {m['macro_f1']:.3f} | "
+            f"{format_time(time.time() - epoch_start)}"
+            + (f" (about {format_time(time_left)} left)" if epoch < epochs else "")
+            + (" *best*" if is_best else "")
         )
-        if best is None or m["micro_f1"] > best["micro_f1"]:
-            best = {**m, "epoch": epoch}
-            best_weights = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-    model.load_state_dict(best_weights)
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, best, is_best)
     return best
+
+
+def save_training_state(path, model, optimizer, scheduler, epoch, best, config):
+    """Everything needed to continue training after `epoch`: weights, optimiser and
+    learning-rate-schedule state, best score so far, and the settings of the run."""
+    tmp = path + ".tmp"
+    torch.save(
+        {
+            "epoch": epoch,
+            "best": best,
+            "config": config,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+        },
+        tmp,
+    )
+    os.replace(tmp, path)  # write then rename: a crash mid-save never leaves a broken file
+
+
+def load_training_state(path, model, optimizer, scheduler, config):
+    """Load a saved state into model/optimizer/scheduler. Returns (next epoch, best metrics).
+    Refuses if the run's settings changed, because the data split and the learning-rate
+    schedule would no longer match."""
+    # weights_only=False because the file also holds optimiser/scheduler settings, not just
+    # tensors. That is fine for files you saved yourself; never load one from someone else.
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    changed = sorted(k for k in set(config) | set(state["config"])
+                     if config.get(k) != state["config"].get(k))
+    if changed:
+        raise ValueError(
+            f"{path} was saved by a run with different settings: {', '.join(changed)}.\n"
+            f"Put those settings back to resume, or delete {path} (or set RESUME = False) "
+            f"to start a new run."
+        )
+    model.load_state_dict(state["model"])
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    return state["epoch"] + 1, state["best"]

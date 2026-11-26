@@ -1,5 +1,5 @@
-"""Predict arXiv categories for a paper title (and optionally its abstract).
-
+"""
+    Predict arXiv categories for a paper title (and optionally its abstract)
     python predict.py "Étale fundamental groups in algebraic geometry"
     python predict.py "Some title" --abstract "The abstract..." --threshold 0.3
 """
@@ -10,12 +10,15 @@ from transformers import AutoTokenizer
 from dataprocess import paper_text
 from modelclassifier import load_checkpoint
 
-
 CHECKPOINT = "arxiv_classifier.pt"
 THRESHOLD = 0.5
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():   # Apple Silicon GPU (M1, M2, …)
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 class Predictor:
     """Loads the model, tokenizer and category list once; then predict() can be called many times."""
@@ -41,7 +44,6 @@ class Predictor:
         """Categories whose probability is at least `threshold`."""
         return [(cat, p) for cat, p in self.probabilities(title, abstract) if p >= threshold]
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("title", nargs="?", default=(
@@ -65,7 +67,6 @@ def main():
         print("  No category exceeded the threshold. Top 3:")
         for cat, p in ranked[:3]:
             print(f"  {cat:<20} {p:.3f}")
-
 
 if __name__ == "__main__":
     main()

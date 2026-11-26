@@ -15,3 +15,7 @@ venv/
 env/
 ENV/
 .virtualenv/
+
+arxiv_metadata.json 
+arxiv_index.json
+arxiv_index.npy

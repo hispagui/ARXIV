@@ -24,8 +24,12 @@ NB_PAPERS = 8192          # None = the whole file
 MAX_LEN = 256             # MiniLM-L6 was trained on up to 256 tokens
 BATCH_SIZE = 128
 INDEX = "arxiv_index"     # writes arxiv_index.npy (vectors) + arxiv_index.json (ids, titles)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():   # Apple Silicon GPU (M1, M2, …)
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 def load_encoder(checkpoint=None):
     """The base MiniLM model, or the encoder part of a fine-tuned checkpoint."""
