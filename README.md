@@ -10,6 +10,7 @@ Classify: predict a paper's arXiv categories from its title/abstract (python `ma
 `all-MiniLM-L6-v2` is already trained for semantic similarity, so search works without any training. Fine-tuning on categories (`main.py`) is optional for search: you can build a second index with the fine-tuned encoder and compare the results.
 
 ## Setup
+
 python -m venv .venv && source .venv/bin/activate
 
 And have torch>=2.1 transformers>=4.36 numpy>=1.24

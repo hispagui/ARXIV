@@ -1,1 +1,17 @@
 arxiv_metadata.json
+__pycache__/
+.env
+.env.*
+!.env.example
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
